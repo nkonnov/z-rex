@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>NetStrike // L4-L7 Traffic & Threat Generator</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <!-- Локальная копия Chart.js: изолированный стенд работает без доступа в интернет -->
+  <script src="chart.umd.min.js"></script>
   <style>
     :root {
       --bg: #0b0f19;
@@ -58,6 +59,8 @@
 
     .status-box { margin-top: 12px; padding: 10px; border-radius: 6px; background: #0b0f19; border: 1px solid var(--border); font-size: 0.83rem; }
     .toast { position: fixed; bottom: 18px; right: 18px; padding: 10px 16px; border-radius: 8px; background: #1e293b; border: 1px solid var(--accent); color: #fff; display: none; z-index: 999; }
+    .token-input { padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border); background: #0b0f19; color: var(--text); font-size: 0.8rem; width: 120px; }
+    .token-input:focus { outline: none; border-color: var(--accent); }
   </style>
 </head>
 <body>
@@ -67,8 +70,10 @@
     <div class="badges">
       <div id="ports-container" class="badges"></div>
       <span id="conn-status" class="badge">Ожидание</span>
-      <a href="/api/reports/download/csv" class="btn btn-outline">⬇ CSV</a>
-      <a href="/api/reports/download/pdf" class="btn btn-outline">⬇ PDF</a>
+      <input type="password" id="api-token" class="token-input" placeholder="API-токен"
+             title="Токен сервера (NETSTRIKE_API_TOKEN). Хранится локально в браузере." />
+      <button class="btn btn-outline" onclick="downloadReport('csv')">⬇ CSV</button>
+      <button class="btn btn-outline" onclick="downloadReport('pdf')">⬇ PDF</button>
     </div>
   </div>
 
@@ -248,15 +253,52 @@
       document.getElementById('pct-sqli').textContent = Math.round((s / sum) * 100);
     }
 
+    // --- Аутентификация: токен хранится локально и передаётся во все запросы ---
+    function getToken() { return localStorage.getItem('netstrike_token') || ''; }
+
+    function authHeaders(extra = {}) {
+      const t = getToken();
+      if (t) extra['X-API-Key'] = t;
+      return extra;
+    }
+
+    function saveToken() {
+      const v = document.getElementById('api-token').value.trim();
+      if (v) localStorage.setItem('netstrike_token', v);
+      else localStorage.removeItem('netstrike_token');
+      // Переподключаем WS уже с новым токеном (и сбрасываем бэкофф).
+      reconnectWS();
+    }
+
     async function apiPost(url, body) {
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: body ? JSON.stringify(body) : null
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Ошибка запроса');
       return data;
+    }
+
+    // Скачивание отчётов через fetch с токеном (ссылки <a> не умеют заголовки).
+    async function downloadReport(kind) {
+      try {
+        const res = await fetch(`/api/reports/download/${kind}`, { headers: authHeaders() });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.detail || 'Отчёт ещё не сформирован');
+        }
+        const blob = await res.blob();
+        const cd = res.headers.get('content-disposition') || '';
+        const m = cd.match(/filename="?([^";]+)"?/);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = m ? m[1] : `netstrike_report.${kind}`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) { showToast(e.message, true); }
     }
 
     async function startTest() {
@@ -346,9 +388,31 @@
       chart.update();
     }
 
+    // --- WebSocket: токен в URL, без ретрая при 1008, бэкофф реконнекта ---
+    let activeWS = null;
+    let wsRetryMs = 2000;        // экспоненциальный бэкофф 2с → 30с
+    let suppressReconnect = false;
+
+    function reconnectWS() {
+      wsRetryMs = 2000;
+      if (activeWS) {
+        suppressReconnect = true;
+        try { activeWS.close(); } catch (e) { /* уже закрыт */ }
+      }
+      setTimeout(() => { suppressReconnect = false; connectWS(); }, 100);
+    }
+
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${location.host}/ws/telemetry`);
+      const token = getToken();
+      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      const ws = new WebSocket(`${proto}//${location.host}/ws/telemetry${qs}`);
+      activeWS = ws;
+
+      ws.onopen = () => {
+        wsRetryMs = 2000;  // успешное подключение сбрасывает бэкофф
+        setConnStatus('● ПОДКЛЮЧЁН', 'up');
+      };
 
       ws.onopen = () => setConnStatus('● ПОДКЛЮЧЁН', 'up');
 
@@ -395,11 +459,26 @@
         }
       };
       ws.onerror = () => setConnStatus('● ПЕРЕПОДКЛЮЧЕНИЕ…', 'down');
-      ws.onclose = () => {
+      ws.onclose = (evt) => {
+        if (suppressReconnect) return;
+        if (evt.code === 1008) {
+          // Сервер требует токен: реконнект бессмыслен, пока его не введут.
+          setConnStatus('● НУЖЕН ТОКЕН', 'down');
+          showToast('Сервер отклонил подключение: введите API-токен в шапке', true);
+          return;
+        }
         setConnStatus('● ПЕРЕПОДКЛЮЧЕНИЕ…', 'down');
-        setTimeout(connectWS, 2000);
-        };
+        setTimeout(connectWS, wsRetryMs);
+        wsRetryMs = Math.min(wsRetryMs * 2, 30000);
+      };
     }
+
+    // Инициализация: подставить сохранённый токен и подключиться.
+    document.getElementById('api-token').value = getToken();
+    document.getElementById('api-token').addEventListener('change', saveToken);
+    // Enter сохраняет токен сразу, не дожидаясь потери фокуса.
+    document.getElementById('api-token').addEventListener('keydown',
+      (e) => { if (e.key === 'Enter') { e.preventDefault(); saveToken(); } });
     recalcWeights();
     connectWS();
   </script>

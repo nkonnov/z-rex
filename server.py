@@ -193,6 +193,10 @@ class TRexManager:
         self._last_connect_fail = 0.0
         self._idle_ticks = 0
         self._rec_session_id: Optional[str] = None  # сессия, в которую пишет телеметрия
+        # Калибровка «mult → Гбит/с» после ручного старта (автопоиск калибрует сам).
+        self._manual_calib_pending = False
+        self._manual_target_gbps = 0.0
+        self._last_applied_mult = 0.0
         self._port_cache: list = []
         self._port_cache_ts = 0.0
         self._state_lock = threading.Lock()
@@ -312,6 +316,30 @@ class TRexManager:
         if self._active_profile and applied_mult > 0 and measured_tx_gbps > MIN_RATE_GBPS:
             self._mult_per_gbps[self._active_profile] = applied_mult / measured_tx_gbps
 
+    def _maybe_calibrate_manual(self, tx_gbps: float) -> None:
+        """Однократная калибровка после РУЧНОГО старта (раньше — только в автопоиске).
+
+        Первый тик телеметрии с фактической полосой выше шума уточняет коэффициент
+        «mult → Гбит/с» и до-подстраивает mult до целевой полосы, поэтому кнопка
+        «Изменить Гбит/с» и старт по target_gbps работают по факту, а не по грубой
+        оценке (для emix2 — не по константе 1.0).
+        Вызывается только из цикла телеметрии (в рабочем потоке TRex).
+        """
+        if not self._manual_calib_pending or self.client is None:
+            return
+        if tx_gbps <= MIN_RATE_GBPS:
+            return
+        self._manual_calib_pending = False
+        self.calibrate(self._last_applied_mult, tx_gbps)
+        try:
+            target_mult = self._mult(self._manual_target_gbps)
+            drift = abs(target_mult - self._last_applied_mult)
+            if self.client.is_traffic_active() and drift > 0.01 * max(target_mult, 0.01):
+                self.client.update(mult=target_mult)
+                self._last_applied_mult = target_mult
+        except Exception as e:
+            print(f"[Calibration warning]: {e}")
+
     # --- загрузка и запуск профилей ---------------------------------------
     def _load_emix2(self) -> None:
         path = os.path.join(trex_setup.TREX_PATH, "astf", "emix2.py")
@@ -353,7 +381,9 @@ class TRexManager:
                 self._mult_per_gbps[profile_key] = ratio
                 self._active_profile = profile_key
                 self._idle_ticks = 0
-                self.client.start(mult=self._mult(gbps), duration=duration)
+                mult = self._mult(gbps)
+                self.client.start(mult=mult, duration=duration)
+                self._last_applied_mult = mult
                 return
             except RuntimeError:
                 raise  # ошибки пользователя/линков — без повтора
@@ -373,10 +403,15 @@ class TRexManager:
             loader, key, ratio = self._load_emix2, PROFILE_EMIX2, 1.0  # 1 mult ≈ 1 Гбит/с, уточняется калибровкой
 
         self._start_profile(loader, key, ratio, config.target_gbps, config.duration)
+        # Ручной запуск: коэффициент уточним по первому тику телеметрии с фактом.
+        self._manual_calib_pending = True
+        self._manual_target_gbps = config.target_gbps
         # Сессию открываем только после успешного старта — иначе при сбое останется пустой отчёт.
         report_mgr.start_session(mode=config.profile_mode, params=config.model_dump())
 
     def start_emix2_continuous(self, gbps: float) -> None:
+        # Автопоиск калибрует коэффициент сам на первом уровне — pending не нужен.
+        self._manual_calib_pending = False
         self._start_profile(self._load_emix2, PROFILE_EMIX2, 1.0, gbps, EMIX2_DURATION_S)
 
     # --- управление и остановка -------------------------------------------
@@ -385,6 +420,8 @@ class TRexManager:
             return None
         mult = self._mult(target_gbps)
         self.client.update(mult=mult)
+        self._last_applied_mult = mult
+        self._manual_target_gbps = target_gbps
         return mult
 
     def stop_test(self) -> None:
@@ -445,6 +482,9 @@ class TRexManager:
             self.disconnect()
             return {"status": "disconnected", "ports": [], "detail": str(e),
                     "autobench": self.ab_snapshot()}
+
+        # Калибровка ручного запуска — по первому тику с фактической полосой.
+        self._maybe_calibrate_manual(payload["global"]["tx_gbps"])
 
         try:
             self._record_tick(payload, active)
@@ -862,10 +902,12 @@ async def broadcast_telemetry(data: dict) -> None:
 
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket, token: Optional[str] = None):
+    # accept() до close: иначе браузер увидит отказ хендшейка (код 1006),
+    # а не close-кадр 1008, по которому панель показывает «Нужен токен».
+    await websocket.accept()
     if not _token_ok(token or ""):
         await websocket.close(code=1008)
         return
-    await websocket.accept()
     subscribers.add(websocket)
     try:
         # Клиент ничего не присылает: ждём дисконнект (бросит WebSocketDisconnect).
@@ -885,3 +927,12 @@ async def get_dashboard():
     if not os.path.exists(html_path):
         raise HTTPException(status_code=404, detail="Файл index.html не найден рядом с server.py")
     return FileResponse(html_path, media_type="text/html")
+
+
+@app.get("/chart.umd.min.js")
+async def get_chartjs():
+    """Локальная копия Chart.js: изолированный стенд работает без CDN."""
+    path = os.path.join(BASE_DIR, "chart.umd.min.js")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="chart.umd.min.js не найден рядом с server.py")
+    return FileResponse(path, media_type="application/javascript")
