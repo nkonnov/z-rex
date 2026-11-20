@@ -1,7 +1,8 @@
 import os
 import csv
+import threading
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 try:
     from fpdf import FPDF
@@ -11,32 +12,68 @@ except ImportError:
 
 
 class ReportManager:
+    """Накопление телеметрии и экспорт отчётов.
+
+    Жизненный цикл сессии атомарен: все методы выполняются под внутренней
+    блокировкой, поэтому внешним вызывающим достаточно вызывать методы без
+    собственных локов. finish_session дополнительно сверяет session_id, чтобы
+    «запаздывающий» вызов не закрыл уже новую сессию.
+    """
+
     def __init__(self, reports_dir: str = "reports"):
         self.reports_dir = reports_dir
         os.makedirs(self.reports_dir, exist_ok=True)
+        self._lock = threading.Lock()
+        self._last_test_id = ""
+        self._seq = 0
         self.is_recording: bool = False
         self.meta: Dict[str, Any] = {}
         self.records: List[Dict[str, Any]] = []
         self.latest_csv: Optional[str] = None
         self.latest_pdf: Optional[str] = None
 
-    def start_session(self, mode: str, params: Dict[str, Any]):
-        if self.is_recording:
-            # Не теряем данные незавершённой сессии: сначала записываем её отчёт.
-            self.finish_session()
-        self.is_recording = True
-        self.records = []
-        self.meta = {
-            "test_id": time.strftime("%Y%m%d_%H%M%S"),
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "mode": mode,
-            "params": params,
-            "summary": {}
-        }
+    def _next_test_id(self) -> str:
+        """test_id с точностью до секунды; при коллизии — уникальный суффикс
+        (иначе две сессии в одну секунду перезаписали бы файлы друг друга)."""
+        base = time.strftime("%Y%m%d_%H%M%S")
+        if base == self._last_test_id:
+            self._seq += 1
+            return f"{base}_{self._seq}"
+        self._last_test_id = base
+        self._seq = 0
+        return base
 
-    def add_point(self, telemetry: Dict[str, Any], autobench_state: Optional[Dict[str, Any]] = None):
-        if not self.is_recording:
-            return
+    def start_session(self, mode: str, params: Dict[str, Any]) -> str:
+        """Открыть новую сессию. Незавершённая сессия сохраняется в отчёт.
+        Возвращает test_id открытой сессии."""
+        with self._lock:
+            if self.is_recording:
+                # Не теряем данные незавершённой сессии: сначала записываем её отчёт.
+                self._finish_session_locked()
+            test_id = self._next_test_id()
+            self.is_recording = True
+            self.records = []
+            self.meta = {
+                "test_id": test_id,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": mode,
+                "params": params,
+                "summary": {}
+            }
+            return test_id
+
+    def add_point(self, telemetry: Dict[str, Any],
+                  autobench_state: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Добавить сэмпл. Возвращает test_id сессии или None, если запись не идёт."""
+        with self._lock:
+            if not self.is_recording:
+                return None
+            self._append_record(telemetry, autobench_state)
+            return self.meta["test_id"]
+
+    def _append_record(self, telemetry: Dict[str, Any],
+                       autobench_state: Optional[Dict[str, Any]] = None) -> None:
+        """Вызывается только под self._lock."""
         g = telemetry.get("global", {})
         c = telemetry.get("l7_client", {})
         ab = autobench_state or {}
@@ -56,9 +93,22 @@ class ReportManager:
             "ab_gbps": ab.get("current_gbps", "-")
         })
 
-    def finish_session(self, summary: Optional[Dict[str, Any]] = None):
-        if not self.is_recording:
-            return
+    def finish_session(self, summary: Optional[Dict[str, Any]] = None,
+                       session_id: Optional[str] = None) -> None:
+        """Завершить текущую сессию атомарно.
+
+        session_id (test_id из start_session/add_point) защищает от гонки:
+        если сессия уже сменилась, чужая (новая) сессия закрыта не будет.
+        """
+        with self._lock:
+            if not self.is_recording:
+                return
+            if session_id is not None and self.meta.get("test_id") != session_id:
+                return
+            self._finish_session_locked(summary)
+
+    def _finish_session_locked(self, summary: Optional[Dict[str, Any]] = None) -> None:
+        """Вызывается только под self._lock."""
         self.is_recording = False
         self.meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.meta["summary"] = self._compute_summary(summary or {})
@@ -72,6 +122,23 @@ class ReportManager:
 
         self.latest_csv = csv_path
         self.latest_pdf = pdf_path
+
+    # --- снимки состояния (потокобезопасные) ------------------------------
+    def is_recording_now(self) -> bool:
+        with self._lock:
+            return self.is_recording
+
+    def current_session_id(self) -> Optional[str]:
+        with self._lock:
+            return self.meta.get("test_id") if self.is_recording else None
+
+    def latest_paths(self) -> Tuple[Optional[str], Optional[str]]:
+        with self._lock:
+            return self.latest_csv, self.latest_pdf
+
+    def meta_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self.meta)
 
     def _compute_summary(self, extra_summary: Dict[str, Any]) -> Dict[str, Any]:
         if not self.records:

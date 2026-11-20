@@ -43,15 +43,24 @@ PROFILE_CUSTOM = "custom_mix"
 PROFILE_EMIX2 = "astf_emix2"
 EMIX2_DURATION_S = 86400          # «бесконечный» прогон, останавливается явно
 SAMPLE_INTERVAL_S = 0.5           # шаг опроса счётчиков внутри окна измерения
+TELEMETRY_INTERVAL_S = 1.0        # период единого цикла опроса TRex (lifespan)
 CONNECT_BACKOFF_S = 3.0           # пауза между попытками подключения к TRex
 PORT_INFO_TTL_S = 5.0             # кэш состояния портов
 MIN_RATE_GBPS = 0.1               # ниже этого полосу считаем шумом
 BW_DEGRADATION_RATIO = 0.92       # падение RX относительно пика успешных шагов
 MIN_PEAK_FOR_DEGRADATION = 0.5    # Гбит/с, ниже — деградацию не проверяем
 
+# Таймауты на RPC к TRex: зависший вызов не должен блокировать API навечно.
+TREX_TIMEOUT_STATS_S = 10.0       # статистика / телеметрия / масштабирование
+TREX_TIMEOUT_START_S = 60.0       # загрузка профиля и старт трафика
+TREX_TIMEOUT_STOP_S = 15.0        # остановка трафика / отключение
+TREX_TIMEOUT_CONNECT_S = 15.0     # подключение и захват портов
+
 trex_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trex")
 report_mgr = ReportManager(reports_dir=REPORTS_DIR)
-report_lock = threading.Lock()
+# WebSocket-подписчики телеметрии. Доступ только из event loop: итерация в
+# broadcast идёт по копии списка, поэтому лок не требуется.
+subscribers = set()
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +192,7 @@ class TRexManager:
         self._active_profile: Optional[str] = None
         self._last_connect_fail = 0.0
         self._idle_ticks = 0
+        self._rec_session_id: Optional[str] = None  # сессия, в которую пишет телеметрия
         self._port_cache: list = []
         self._port_cache_ts = 0.0
         self._state_lock = threading.Lock()
@@ -239,6 +249,23 @@ class TRexManager:
             with contextlib.suppress(Exception):
                 self.client.disconnect()
             self.client = None
+
+    def poison(self) -> None:
+        """Аварийно разорвать соединение при зависшем RPC.
+
+        Вызывается из event loop при таймауте: рабочий поток занят зависшим
+        вызовом, поэтому disconnect выполняется в отдельном потоке-убийце,
+        а self.client обнуляется — следующий вызов построит новое соединение.
+        """
+        client = self.client
+        self.client = None
+        # Бэкофф: не пытаемся переподключиться мгновенно к тому же зависшему серверу.
+        self._last_connect_fail = time.monotonic()
+        if client is not None:
+            def _kill():
+                with contextlib.suppress(Exception):
+                    client.disconnect()
+            threading.Thread(target=_kill, daemon=True, name="trex-kill").start()
 
     def _require_client(self) -> ASTFClient:
         self.connect()
@@ -347,8 +374,7 @@ class TRexManager:
 
         self._start_profile(loader, key, ratio, config.target_gbps, config.duration)
         # Сессию открываем только после успешного старта — иначе при сбое останется пустой отчёт.
-        with report_lock:
-            report_mgr.start_session(mode=config.profile_mode, params=config.model_dump())
+        report_mgr.start_session(mode=config.profile_mode, params=config.model_dump())
 
     def start_emix2_continuous(self, gbps: float) -> None:
         self._start_profile(self._load_emix2, PROFILE_EMIX2, 1.0, gbps, EMIX2_DURATION_S)
@@ -370,11 +396,12 @@ class TRexManager:
         except Exception as e:
             print(f"[TRex stop warning]: {e}")
 
-        with report_lock:
-            recording = report_mgr.is_recording
-            summary = self.autobench_summary() if recording else {}
-        if recording:
-            report_mgr.finish_session(summary=summary)
+        # Финализируем только ту сессию, что видели при входе: ReportManager
+        # атомарен, а session_id не даст закрыть уже новую сессию при гонке.
+        session_id = report_mgr.current_session_id()
+        if session_id is not None:
+            report_mgr.finish_session(summary=self.autobench_summary(),
+                                      session_id=session_id)
 
     def get_raw_stats(self) -> dict:
         return self._require_client().get_stats()
@@ -426,29 +453,65 @@ class TRexManager:
         return payload
 
     def _record_tick(self, payload: dict, active: bool) -> None:
-        finish = False
-        with report_lock:
-            if active:
-                self._idle_ticks = 0
-                if report_mgr.is_recording:
-                    report_mgr.add_point(payload, self.ab_snapshot() if self.ab_active() else None)
-                return
-            if self.ab_active() or not report_mgr.is_recording:
-                return
-            # Завершаем сессию только после двух подряд «idle»-тиков, чтобы
-            # кратковременная пауза между запуском и стартом трафика не закрывала отчёт.
-            self._idle_ticks += 1
-            finish = self._idle_ticks >= 2
-        if finish:
-            report_mgr.finish_session()
+        """Запись тика телеметрии в отчёт.
+
+        Вызывается только из единого цикла телеметрии, поэтому собственные
+        атрибуты _idle_ticks/_rec_session_id блокировок не требуют; сам
+        ReportManager защищает свои данные внутренней блокировкой.
+        """
+        if active:
+            self._idle_ticks = 0
+            sid = report_mgr.add_point(
+                payload, self.ab_snapshot() if self.ab_active() else None)
+            if sid:
+                self._rec_session_id = sid
+            return
+        if self.ab_active() or not report_mgr.is_recording_now():
+            return
+        # Завершаем сессию только после двух подряд «idle»-тиков, чтобы
+        # кратковременная пауза между запуском и стартом трафика не закрывала отчёт.
+        self._idle_ticks += 1
+        if self._idle_ticks >= 2:
+            report_mgr.finish_session(session_id=self._rec_session_id)
+            self._rec_session_id = None
 
 
 trex_mgr = TRexManager()
 
 
-async def run_in_trex_thread(func, *args):
+def reset_trex_executor() -> None:
+    """Пересоздать рабочий поток TRex.
+
+    Поток старого executor потерян на зависшем RPC и освободиться не может;
+    новый executor позволяет последующим вызовам работать с новым соединением.
+    """
+    global trex_executor
+    old = trex_executor
+    trex_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trex")
+    try:
+        old.shutdown(wait=False, cancel_futures=True)
+    except TypeError:  # Python < 3.9 — параметр cancel_futures отсутствует
+        old.shutdown(wait=False)
+
+
+async def run_in_trex_thread(func, *args, timeout_s: float = TREX_TIMEOUT_STATS_S):
+    """Выполнить вызов к TRex в едином рабочем потоке с таймаутом.
+
+    При зависании RPC: соединение аварийно разрывается (trex_mgr.poison()),
+    executor пересоздаётся, а вызывающий получает asyncio.TimeoutError —
+    API отвечает ошибкой, а не блокируется навечно (включая /api/test/stop).
+    """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(trex_executor, func, *args)
+    fut = loop.run_in_executor(trex_executor, func, *args)
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        func_name = getattr(func, "__name__", str(func))
+        print(f"[TRex timeout] {func_name} не завершился за {timeout_s:.0f} с — "
+              f"разрываем соединение и пересоздаём рабочий поток")
+        trex_mgr.poison()
+        reset_trex_executor()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -547,9 +610,9 @@ async def execute_autobench(cfg: AutoBenchConfig) -> None:
     first_bad = 0.0
 
     try:
-        await run_in_trex_thread(trex_mgr.start_emix2_continuous, cfg.start_gbps)
-        with report_lock:
-            report_mgr.start_session(mode="autobench_emix2", params=cfg.model_dump())
+        await run_in_trex_thread(trex_mgr.start_emix2_continuous, cfg.start_gbps,
+                                 timeout_s=TREX_TIMEOUT_START_S)
+        report_mgr.start_session(mode="autobench_emix2", params=cfg.model_dump())
 
         # Фаза 1: линейный разгон. Уровни считаются от индекса — без накопления ошибки float.
         k = 0
@@ -624,7 +687,7 @@ async def execute_autobench(cfg: AutoBenchConfig) -> None:
             active=False, phase="finished", status=status, message=msg,
             best_gbps=best_gbps, best_rx_gbps=best_rx, best_mpps=best_mpps,
         )
-        await run_in_trex_thread(trex_mgr.stop_test)
+        await run_in_trex_thread(trex_mgr.stop_test, timeout_s=TREX_TIMEOUT_STOP_S)
 
 
 async def _cancel_autobench() -> None:
@@ -643,17 +706,28 @@ async def _cancel_autobench() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        await run_in_trex_thread(trex_mgr.connect)
+        await run_in_trex_thread(trex_mgr.connect, timeout_s=TREX_TIMEOUT_CONNECT_S)
     except Exception as e:
         print(f"Ошибка при подключении к TRex: {e}")
     if not API_TOKEN:
         print("[WARN] NETSTRIKE_API_TOKEN не задан: API без авторизации. "
               "Слушайте 127.0.0.1 или задайте токен.", file=sys.stderr)
-    yield
-    # Корректное завершение: отменить автопоиск, остановить трафик, отключиться.
-    await _cancel_autobench()
-    await run_in_trex_thread(trex_mgr.stop_test)
-    await run_in_trex_thread(trex_mgr.disconnect)
+
+    # Единственный цикл телеметрии: опрашивает TRex, пишет отчёт и рассылает
+    # снапшот подписчикам — независимо от числа открытых вкладок.
+    telemetry = asyncio.create_task(telemetry_loop())
+    try:
+        yield
+    finally:
+        telemetry.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await telemetry
+        # Корректное завершение: отменить автопоиск, остановить трафик, отключиться.
+        await _cancel_autobench()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await run_in_trex_thread(trex_mgr.stop_test, timeout_s=TREX_TIMEOUT_STOP_S)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await run_in_trex_thread(trex_mgr.disconnect, timeout_s=TREX_TIMEOUT_STOP_S)
 
 
 app = FastAPI(title="NetStrike L4-L7 Benchmark API", lifespan=lifespan)
@@ -664,9 +738,11 @@ app = FastAPI(title="NetStrike L4-L7 Benchmark API", lifespan=lifespan)
 async def api_start_test(config: TestConfig):
     await _cancel_autobench()
     try:
-        await run_in_trex_thread(trex_mgr.start_test, config)
+        await run_in_trex_thread(trex_mgr.start_test, config, timeout_s=TREX_TIMEOUT_START_S)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TRex не ответил за отведённое время — соединение разорвано, повторите запуск")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Не удалось запустить тест: {type(e).__name__}: {e}")
@@ -681,6 +757,8 @@ async def api_start_autobench(config: AutoBenchConfig):
         await run_in_trex_thread(trex_mgr.check_ports_link)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TRex не ответил за отведённое время — соединение разорвано, повторите запрос")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TRex недоступен: {e}")
 
@@ -693,9 +771,11 @@ async def api_start_autobench(config: AutoBenchConfig):
 async def api_stop_test():
     await _cancel_autobench()
     try:
-        await run_in_trex_thread(trex_mgr.stop_test)
+        await run_in_trex_thread(trex_mgr.stop_test, timeout_s=TREX_TIMEOUT_STOP_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TRex не ответил за отведённое время — соединение разорвано, проверьте генератор")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Не удалось остановить: {e}")
     return {"message": "Генерация остановлена"}
 
 
@@ -707,6 +787,8 @@ async def api_update_gbps(req: UpdateGbpsRequest):
         applied = await run_in_trex_thread(trex_mgr.update_target_gbps, req.target_gbps)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TRex не ответил за отведённое время — соединение разорвано, повторите запрос")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     if applied is None:
@@ -716,11 +798,10 @@ async def api_update_gbps(req: UpdateGbpsRequest):
 
 @app.get("/api/reports/latest", dependencies=[Depends(require_token)])
 async def api_latest_report():
-    with report_lock:
-        latest = report_mgr.latest_csv
-        meta = dict(report_mgr.meta)
+    csv_path, _ = report_mgr.latest_paths()
+    meta = report_mgr.meta_snapshot()
     return {
-        "available": bool(latest and os.path.exists(latest)),
+        "available": bool(csv_path and os.path.exists(csv_path)),
         "test_id": meta.get("test_id"),
         "summary": meta.get("summary", {}),
     }
@@ -728,8 +809,7 @@ async def api_latest_report():
 
 @app.get("/api/reports/download/csv", dependencies=[Depends(require_token)])
 async def api_download_csv():
-    with report_lock:
-        path = report_mgr.latest_csv
+    path, _ = report_mgr.latest_paths()
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Отчёт ещё не сформирован. Запустите и завершите тест.")
     return FileResponse(path=path, filename=os.path.basename(path), media_type="text/csv")
@@ -737,11 +817,47 @@ async def api_download_csv():
 
 @app.get("/api/reports/download/pdf", dependencies=[Depends(require_token)])
 async def api_download_pdf():
-    with report_lock:
-        path = report_mgr.latest_pdf
+    _, path = report_mgr.latest_paths()
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Отчёт ещё не сформирован. Запустите и завершите тест.")
     return FileResponse(path=path, filename=os.path.basename(path), media_type="application/pdf")
+
+
+async def telemetry_loop() -> None:
+    """Единый цикл телеметрии: опрос TRex, запись отчёта, broadcast подписчикам.
+
+    Существует всегда (запускается в lifespan), поэтому запись отчёта и
+    автозакрытие по «idle»-тикам не зависят от числа WebSocket-клиентов.
+    """
+    while True:
+        try:
+            data = await run_in_trex_thread(trex_mgr.get_telemetry)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # run_in_trex_thread уже разорвал зависшее соединение; на следующем
+            # тике connect() построит новое, а клиенту сообщаем об отключении.
+            data = {"status": "disconnected", "ports": [],
+                    "detail": "TRex не отвечает (таймаут опроса)",
+                    "autobench": trex_mgr.ab_snapshot()}
+        except Exception:
+            traceback.print_exc()
+            data = None
+        if data is not None:
+            await broadcast_telemetry(data)
+        await asyncio.sleep(TELEMETRY_INTERVAL_S)
+
+
+async def broadcast_telemetry(data: dict) -> None:
+    """Разослать снапшот всем подписчикам; отвалившихся — удалить."""
+    dead = []
+    for ws in list(subscribers):  # копия: send_json может ждать, подписчики меняются
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        subscribers.discard(ws)
 
 
 @app.websocket("/ws/telemetry")
@@ -750,15 +866,17 @@ async def websocket_telemetry(websocket: WebSocket, token: Optional[str] = None)
         await websocket.close(code=1008)
         return
     await websocket.accept()
+    subscribers.add(websocket)
     try:
+        # Клиент ничего не присылает: ждём дисконнект (бросит WebSocketDisconnect).
         while True:
-            data = await run_in_trex_thread(trex_mgr.get_telemetry)
-            await websocket.send_json(data)
-            await asyncio.sleep(1.0)
+            await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     except Exception:
         traceback.print_exc()
+    finally:
+        subscribers.discard(websocket)
 
 
 @app.get("/")
